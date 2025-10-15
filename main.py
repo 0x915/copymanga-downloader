@@ -882,12 +882,7 @@ class CopymangaTask:
 
 def Console():
     manga_list = [
-        ("silentwitchchenmodemonvdemimi", "-Silent Witch-沉默的魔女的秘密"),
-        ("yaoyeluying", "搖曳露營△"),
-        ("zgmsbywt", "這個美術部有問題！"),
-        ("yaowushaonvdeninancangtiansanzhilu", "藥屋少女的呢喃～貓貓的後宮解謎手冊～"),
-        ("yaowushaonvdeninan", "葯屋少女的呢喃"),
-        ("zaimowangchengshuowanan", "在魔王城說晚安"),
+        # ("request:copymanga-manga-id", "optional:display-name"),
     ]
 
     def PrintList(manga_list: list):
@@ -973,3 +968,4 @@ def Console():
 
 if __name__ == "__main__":
     Console()
+
