@@ -1,8 +1,6 @@
 # Copymanga Downloader
 基于 Copymanga API 的控制台漫画下载工具
 
-<img width="844" height="262" alt="image" src="https://github.com/user-attachments/assets/9b949bd5-b220-4ce1-88eb-73c4a35a3141" />
-
 ## 尚未完成
 如需试用，需要在脚本运行目录补全bin目录，以及文件  
  - bin\curl
