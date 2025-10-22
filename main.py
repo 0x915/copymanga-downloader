@@ -44,6 +44,27 @@ class win32proxy:
         return False
 
 
+def ClearDir(path: Path) -> int:
+    remove_count = 0
+    for item in path.iterdir():
+        if item.is_file():
+            item.unlink()
+            remove_count += 1
+        else:
+            remove_count += ClearDir(item)
+    return remove_count
+
+
+def SizeDir(path: Path) -> int:
+    total_size = 0
+    for item in path.iterdir():
+        if item.is_file():
+            total_size += item.stat().st_size
+        else:
+            total_size += SizeDir(item)
+    return total_size
+
+
 PROXY = win32proxy().get_proxy()
 
 
@@ -135,8 +156,10 @@ class Console:
                 continue
 
             local_storage = Path(f"{self.download_root}/{name}")
+            
             if local_storage.exists():
-                size = f"{local_storage.stat().st_size / 1024} MiB"
+                print(SizeDir(local_storage))
+                size = f"{SizeDir(local_storage)/1000000:.1f} MiB"
             else:
                 size = "无本地文件"
 
@@ -318,7 +341,7 @@ class Console:
             path_word = data[0]
             manga_name = data[1]
             print(f"{str(i).zfill(2)}. [ {manga_name} | {path_word} ] ")
-            
+
         print()
         return
 
