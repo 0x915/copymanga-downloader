@@ -1,31 +1,31 @@
 import os
 import time
 import winreg
-import datetime
-import requests
-import threading
-import subprocess
 
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Tuple
 
-import sqlalchemy
-from sqlalchemy import inspect, types, select
-from sqlalchemy.orm import Session, DeclarativeBase, Mapped, mapped_column
+import database
+import aria2tool
+import dlmanager
+from copymanga import CopymangaObject
 
-from spdlogger import logger, LoggerUtil
 
+DB_ROOT = Path("db.nosync")
+DOWNLOAD_ROOT = Path("dl.nosync")
+TEMP_ROOT = Path("temp.nosync")
 
-os.system("cls")
-os.system("chcp 65001")
+DB_ROOT.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 class win32proxy:
-    def __init__(self):
+    def __init__(self) -> None:
         self.__path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
         self.__INTERNET_SETTINGS = winreg.OpenKeyEx(winreg.HKEY_CURRENT_USER, self.__path, 0, winreg.KEY_ALL_ACCESS)
 
-    def get_proxy(self):
+    def get_proxy(self) -> str | None:
         ip_port = str()
         if self.is_open_proxy():
             try:
@@ -33,9 +33,9 @@ class win32proxy:
                 return str(ip_port)
             except Exception as e:
                 print(e)
-        return str()
+        return None
 
-    def is_open_proxy(self):
+    def is_open_proxy(self) -> bool:
         try:
             if winreg.QueryValueEx(self.__INTERNET_SETTINGS, "ProxyEnable")[0] == 1:
                 return True
@@ -44,928 +44,329 @@ class win32proxy:
         return False
 
 
-class MangaLocalDatabase:
-    #
-    class Base(DeclarativeBase):
-        pass
-
-    def __init__(self, sqlite_file_path: str, logger: LoggerUtil.Logger):
-        self._logger: LoggerUtil.Logger = logger
-        self._dbfile = Path(f"db.nosync/{sqlite_file_path}")
-
-        self._dbfile.resolve().parent.mkdir(parents=True, exist_ok=True)
-
-        self.engine: sqlalchemy.Engine = sqlalchemy.create_engine(f"sqlite:///{self._dbfile.resolve().as_posix()}")
-
-        if (
-            not inspect(self.engine).has_table("files")  #
-            or not inspect(self.engine).has_table("metadata")
-        ):
-            self._logger.info(f"初始化数据库({self._dbfile.resolve().as_posix()})")
-            MangaLocalDatabase.Base.metadata.create_all(self.engine)
-
-        else:
-            self._logger.info(f"连接数据库({self._dbfile.resolve().as_posix()})")
-
-    def GetDbFilePath(self):
-        return self._dbfile.resolve()
-
-    class FileTableItem(Base):
-        __tablename__ = "files"
-        index: Mapped[int] = mapped_column(types.INTEGER, primary_key=True)
-        filename: Mapped[str] = mapped_column(types.TEXT)
-        basepath: Mapped[str] = mapped_column(types.TEXT)
-        url: Mapped[str] = mapped_column(types.TEXT)
-        status: Mapped[int] = mapped_column(types.INTEGER)
-
-        @staticmethod
-        def Create(
-            filename: str,
-            basepath: str,
-            url: str,
-        ):
-            return MangaLocalDatabase.FileTableItem(
-                filename=filename,
-                basepath=basepath,
-                url=url,
-                status=0,
-            )
-
-    class MetadataTableItem(Base):
-        __tablename__ = "metadata"
-        index: Mapped[int] = mapped_column(types.INTEGER, primary_key=True)
-        name: Mapped[str] = mapped_column(types.TEXT)
-        context: Mapped[str] = mapped_column(types.TEXT)
-        url: Mapped[str] = mapped_column(types.TEXT)
-        status: Mapped[int] = mapped_column(types.INTEGER)
-
-        @staticmethod
-        def Create(
-            name: str,
-            context: str,
-            url: str,
-            status: int,
-        ):
-            return MangaLocalDatabase.MetadataTableItem(
-                name=name,
-                context=context,
-                url=url,
-                status=status,
-            )
-
-
-class RequsetCountLock:
-    def __init__(self, num: int) -> None:
-        self._queue: List[datetime.datetime] = []
-        self._lock = threading.Lock()
-        self._num = num
-        self._logger = logger.ObjLogger(self)
-
-    def ReleaseTime(self):
-        if len(self._queue) == 0:
-            return 0
-        return (self._queue[0] - datetime.datetime.now()).seconds
-
-    def Ready(self):
-        self._lock.acquire()
-        ret = True
-        while len(self._queue) >= self._num:
-            if self._queue[0] > datetime.datetime.now():
-                ret = False
-                break
-            self._queue.pop(0)
-            ret = True
-            break
-        self._lock.release()
-        return ret
-
-    def CountAdd(self):
-        self._lock.acquire()
-        self._queue.append(datetime.datetime.now() + datetime.timedelta(seconds=61))
-        self._lock.release()
-
-    def Refresh(self):
-        self._lock.acquire()
-        while len(self._queue) != 0:
-            if self._queue[0] > datetime.datetime.now():
-                break
-            self._queue.pop(0)
-            continue
-        self._lock.release()
-        return
-
-    def __str__(self) -> str:
-        self.Refresh()
-        return f"[{len(self._queue)}/{self._num}]"
-
-
-globle_download_request_lock = RequsetCountLock(99)
-
-
-class MultiCurl:
-    #
-    root = "./dl.nosync"
-
-    class ProcessInfo:
-        def __init__(
-            self,
-            db_item: MangaLocalDatabase.FileTableItem,
-            basecmd: str,
-            logger: LoggerUtil.Logger,
-        ) -> None:
-            self.logger = logger
-            self.orm: MangaLocalDatabase.FileTableItem = db_item
-
-            url = self.orm.url
-
-            if not url.startswith("http"):
-                self.logger.error(f"非法URL {url}")
-                self.orm.status = -255
-                return
-
-            basepath = self.orm.basepath
-            filename = self.orm.filename
-            fullpath = Path(f"{MultiCurl.root}/{basepath}/{filename}")
-            fullpath.parent.mkdir(parents=True, exist_ok=True)
-
-            if fullpath.exists() and fullpath.is_dir():
-                raise TypeError(f"文件保存路径({fullpath.as_posix()})被目录占用")
-
-            if fullpath.exists() and fullpath.is_file():
-                self.logger.info(f"删除文件({fullpath.as_posix()})")
-                fullpath.unlink()
-
-            self.cmd = f'{basecmd} -o "{fullpath.as_posix()}" {url}'
-
-            self.process: subprocess.Popen = self._Run()
-            self.timeout = datetime.datetime.now() + datetime.timedelta(seconds=120)
-            self.orm.status = 1
-            self.logger.info(f"创建进程(PID={str(self.process.pid).zfill(5)}) {self.process.args}")
-
-        def _Run(self):
-            return subprocess.Popen(
-                self.cmd,
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-        def Restart(self):
-            if self.process.poll() is None:
-                self.process.kill()
-            self.process = self._Run()
-            self.timeout = datetime.datetime.now() + datetime.timedelta(seconds=120)
-            self.logger.info(f"重试进程({str(self.process.pid).zfill(5)}) {self.process.args}")
-            return
-
-    def __init__(self, database: MangaLocalDatabase, proxy: str) -> None:
-        self.logger = logger.ObjLogger(self)
-
-        self.proxy: str = ""
-        if len(proxy) != 0:
-            self.proxy = f" -x {proxy}"
-        self.max_process_num = 20
-        self.basecmd = f"./bin/curl{self.proxy}"
-        self.process_list: List[MultiCurl.ProcessInfo] = []
-        self.requset_lock = globle_download_request_lock
-        self.database = database
-        self.session = Session(self.database.engine)
-        self._is_session_close = False
-
-    def _Get(self, value: int):
-        TableItem = MangaLocalDatabase.FileTableItem
-        items: Sequence[MangaLocalDatabase.FileTableItem] = self.session.scalars(
-            select(
-                TableItem,
-            ).where(TableItem.status == value),
-        ).all()
-        return items
-
-    def _GetNotFinish(self) -> List[MangaLocalDatabase.FileTableItem]:
-        return list(self._Get(1))
-
-    def _GetNotStart(self) -> List[MangaLocalDatabase.FileTableItem]:
-        return list(self._Get(0))
-
-    def Run(self):
-        if self._is_session_close is True:
-            self.session = Session(self.database.engine)
-        #
-        not_finish_items = self._GetNotFinish()
-        not_finish_count = len(not_finish_items)
-        if not_finish_count != 0:
-            self.logger.info(f"继续 {not_finish_count} 个未完成任务")
-            self._TaskLoop(not_finish_items)
-
-        not_start_items = self._GetNotStart()
-        not_start_count = len(not_start_items)
-        if not_start_count != 0:
-            self.logger.info(f"开始 {not_start_count} 个新下载任务")
-            self._TaskLoop(not_start_items)
-
-        self.session.close()
-        self._is_session_close = True
-        return
-
-    def _AddTask(self, tasks: List[MangaLocalDatabase.FileTableItem]) -> None:
-        while True:
-            if len(tasks) == 0:
-                return
-            if len(self.process_list) >= self.max_process_num:
-                return
-            # 限制每分钟请求次数
-            if not self.requset_lock.Ready():
-                self.logger.warn(f"等待下载API请求次数 {self.requset_lock.ReleaseTime()}s")
-                time.sleep(1)
-                return
-            task = tasks[0]
-            # 创建下载进程
-            process = MultiCurl.ProcessInfo(
-                task,
-                self.basecmd,
-                self.logger,
-            )
-            self.session.commit()
-            if task.status != 1:
-                continue
-            # 增加到当前任务列表
-            self.process_list.append(process)
-            self.requset_lock.CountAdd()
-            tasks.pop(0)
-            continue
-
-    def _TaskLoop(self, tasks: List[MangaLocalDatabase.FileTableItem]) -> None:
-        while True:
-            task_count = len(tasks)
-            self._AddTask(tasks)
-            if self._ProcessLoop(task_count):
-                continue
-            if not task_count:
-                break
-
-        self.logger.info("下载完成")
-        return
-
-    def _ProcessLoop(self, has_task: int) -> bool:
-        while True:
-            exitcode_list: List[str] = list()
-
-            # 获取进程退出返回值
-            for pinfo in self.process_list:
-                exitcode = pinfo.process.poll()
-
-                # 任务正常退出
-                if exitcode is not None and exitcode == 0:
-                    exitcode_list.append(str(exitcode))
-                    continue
-
-                # 任务异常退出
-                if exitcode is not None:
-                    pinfo.Restart()
-                    exitcode_list.append("!")
-                    continue
-
-                # 任务超时未完成
-                if pinfo.timeout < datetime.datetime.now():
-                    pinfo.Restart()
-                    exitcode_list.append("?")
-                    continue
-
-                exitcode_list.append("-")
-                continue
-
-            # 显示进程运行状态
-            if len(exitcode_list) != 0:
-                msg = str()
-                for s in exitcode_list:
-                    msg += s + ""
-                if len(msg) < self.max_process_num:
-                    msg += " " * (self.max_process_num - len(msg))
-                self.logger.debug(f"[{msg}] 任务容量[{len(exitcode_list)}/{self.max_process_num}] 请求容量{self.requset_lock}")
-                time.sleep(1)
-
-            # 处理已退出进程
-            for pinfo in self.process_list:
-                if pinfo.process.poll() is None:
-                    continue
-                pinfo.orm.status = 255
-                self.session.commit()
-                self.process_list.remove(pinfo)
-
-            # 队列空闲还有剩余任务时返回
-            if (has_task != 0) and (len(self.process_list) < self.max_process_num):
-                return True
-
-            # 无剩余任务队列完成时完成
-            if len(self.process_list) == 0:
-                return False
-
-            continue
-
-
-class CopymangaItem:
-    #
-    class AuthorItem:
-        def __init__(self) -> None:
-            self.name: str = ""
-            self.path_word: str = ""
-
-        @staticmethod
-        def FromMap(author: List[dict] | None) -> "List[CopymangaItem.AuthorItem]":
-            anthor_list: List[CopymangaItem.AuthorItem] = []
-            if author is None:
-                return anthor_list
-            for i in author:
-                obj = CopymangaItem.AuthorItem()
-                obj.name = str(i.get("name"))
-                obj.path_word = str(i.get("path_word"))
-                anthor_list.append(obj)
-            return anthor_list
-
-        def __str__(self) -> str:
-            return f'<{CopymangaItem.AuthorItem.__name__} name="{self.name}" path="{self.path_word}">'
-
-    class ChapterItem:
-        def __init__(self) -> None:
-            self.index: int = 0
-            self.name: str = ""
-            self.uuid: str = ""
-            self.size: int = 0
-            self.comic_id: str = ""
-            self.comic_path_word: str = ""
-            self.group_id: str = ""
-            self.group_path_word: str = ""
-            self.datetime_created: str = ""
-            self.prev_uuid: str = ""
-            self.next_uuid: str = ""
-
-    class GroupItem:
-        def __init__(self) -> None:
-            self.name: str = ""
-            self.path_word: str = ""
-            self.chapters: List[CopymangaItem.ChapterItem] = []
-
-    class MangaItem:
-        def __init__(self) -> None:
-            self.name: str = ""
-            self.alias: str = ""
-            self.path_word: str = ""
-            self.cover: str = ""
-            self.author: List[CopymangaItem.AuthorItem] = []
-            self.status: str = ""
-            self.uuid: str = ""
-            self.groups: List[CopymangaItem.GroupItem] = []
-
-        def FormatAuthor(self):
-            fmt: str = ""
-            for i in self.author:
-                fmt += i.name + ","
-            return fmt[:-1]
-
-        def __str__(self) -> str:
-            return f'<{CopymangaItem.MangaItem.__name__} name="{self.name}" path="{self.path_word}">'
-
-
-class ApiRequsetLock:
-    def __init__(self, num: int) -> None:
-        self._queue: List[datetime.datetime] = []
-        self._lock = threading.Lock()
-        self._num = num
-        self._logger = logger.ObjLogger(self)
-
-    def WaitQueue(self):
-        if self._lock.locked():
-            self._logger.debug("等待API线程锁...")
-
-        self._lock.acquire()
-
-        once_msg = False
-        while len(self._queue) >= self._num:
-            if self._queue[0] >= datetime.datetime.now():
-                if once_msg is False:
-                    self._logger.debug(f"等待API请求次数... {(self._queue[0] - datetime.datetime.now()).seconds}s")
-                    once_msg = True
-                time.sleep(1)
-                continue
-            self._queue.pop(0)
-            continue
-
-        self._queue.append(datetime.datetime.now() + datetime.timedelta(seconds=61))
-
-        self._lock.release()
-        return
-
-    def Refresh(self):
-        while len(self._queue) != 0:
-            if self._queue[0] > datetime.datetime.now():
-                break
-            self._queue.pop(0)
-            continue
-        return
-
-    def __str__(self) -> str:
-        self.Refresh()
-        return f"[{len(self._queue)}/{self._num}]"
-
-
-globle_copymanga_api_lock = ApiRequsetLock(15)
-
-
-class CopymangaTask:
-    #
-    def __init__(self, kw: str = "") -> None:
-        self.logger = logger.ObjLogger(self)
-
-        self.host: str = "mangacopy.com"
-        self.proxy: None | dict = None
-        self.header = {
-            "User-Agent": "duoTuoCartoon/3.2.4 (iPhone; iOS 18.0.1; Scale/3.00) iDOKit/1.0.0 RSSX/1.0.0",
-            "version": "2025.10.12",
-            "region": "0",
-            "webp": "1",
-            "platform": "1",
-            "referer": "https://www.copymanga.com/",
-            "use_oversea_cdn": "1",
-            "use_webp": "1",
+PROXY = win32proxy().get_proxy()
+
+
+class Console:
+    class Command:
+        def __init__(self, is_all: bool, call, argv: List[str], desc: str) -> None:
+            self.support_all = is_all
+            self.argv = argv
+            self.call = call
+            self.desc = desc
+
+        def GetArgc(self):
+            return len(self.argv) + 1
+
+    def __init__(self, temp_root: Path, download_root: Path, database_root: Path, proxy: None | str) -> None:
+        self.comics: List[Tuple[str, str]] = []
+        self.temp_root = temp_root
+        self.download_root = download_root
+        self.database_root = database_root
+        self.proxy = proxy
+
+        self.exit_status = False
+        self.commands_str: str = ""
+
+        Command = self.Command
+
+        self.commands = {
+            "help": Command(True, self.Cmd_Help, [], "显示命令列表"),
+            "update": Command(True, self.Cmd_Update, ["index"], "更新数据库"),
+            "download": Command(True, self.Cmd_Download, ["index"], "下载文件"),
+            "detect": Command(True, self.Cmd_Detect, ["index"], "下载文件"),
+            "check": Command(True, self.Cmd_Check, ["index"], "检查本地文件"),
+            "show": Command(False, self.Cmd_Show, ["index"], "显示详细信息"),
+            "mark": Command(False, self.Cmd_Mark, ["index"], "标记已下载但不存在的文件"),
+            "delete": Command(False, self.Cmd_DeleteDatabase, ["index"], "删除数据库"),
+            "search": Command(False, self.Cmd_Search, ["keyword"], "使用关键词搜索并创建数据库"),
+            "init": Command(False, self.Cmd_Init, ["pathword"], "使用路径词创建数据库"),
+            "list": Command(False, self.ShowComics, [], "显示漫画列表"),
+            "clear": Command(False, self.Cmd_Clear, [], "清除控制台内容"),
+            "exit": Command(False, self.Cmd_Exit, [], "退出"),
         }
 
-        sys_proxy = win32proxy().get_proxy()
-        if sys_proxy:
-            self.logger.info(f"使用系统代理 {sys_proxy}")
-            self.proxy = {"https": f"http://{sys_proxy}"}
+        self.FormatCommands()
+        return
 
-        self.manga: CopymangaItem.MangaItem = CopymangaItem.MangaItem()
-        self.api_lock = globle_copymanga_api_lock
-
-        pathword: str = kw
-
-        if len(kw) == 0:
-            while True:
-                self.logger.info(f"任务未定义漫画id, 搜索关键词(str)=")
-                r = self.Search(input())
-                if r is None:
+    def FormatCommands(self):
+        arg_list: List[str] = []
+        desc_list: List[str] = []
+        for command1 in self.commands.keys():
+            detail = self.commands[command1]
+            arg = f"{command1} "
+            for value in detail.argv:
+                if detail.support_all and value == "index":
+                    arg += f"[{value}/all] "
                     continue
-                pathword = r
-                break
+                arg += f"[{value}] "
+                continue
+            arg_list.append(arg)
+            desc_list.append(detail.desc)
+            continue
 
-        if self._InitInfo(pathword) is False:
-            self.logger.error(f"输入的漫画(id={kw})不存在")
-            raise ValueError
+        arg_length = 0
+        for arg in arg_list:
+            arg_length = max(arg_length, len(arg))
 
-        self.local_storage = Path(f"./dl.nosync/{self.manga.name}")
+        self.commands_str: str = ""
+        for arg, desc in zip(arg_list, desc_list):
+            self.commands_str += f"{arg:{arg_length}s}    {desc}\n"
 
-        self.database: MangaLocalDatabase = MangaLocalDatabase(
-            f"{self.manga.path_word}.db",
-            self.logger,
-        )
+        return
 
-    def _ApiGet(self, url, msg: str = "") -> dict:
-        self.api_lock.WaitQueue()
-        err = 0
-        while True:
+    def ScanComics(self):
+        self.comics.clear()
+
+        for db_file in self.database_root.glob(f"*.db"):
+            pathword = "UnknownPathword"
+            name = "UnknownDisplay"
+
             try:
-                self.logger.debug(f"{msg}请求 {url} 请求容量{self.api_lock}")
-                ret = requests.get(url, headers=self.header, proxies=self.proxy)
-                break
-            except Exception as e:
-                err += 1
-                self.logger.warn(f"{msg}连接失败, 重试第{err})次")
-                self.logger.warn(f"{msg}| {e}")
-            if err > 4:
-                self.logger.error(f"{msg}无法请求 {url}.")
-                raise ConnectionError
+                db = database.SqliteClient(db_file)
+                check_name = CopymangaObject.GetMetadata(db, "__name__")
+                if check_name is not None:
+                    name = check_name[0][1]
+                check_pathword = CopymangaObject.GetMetadata(db, "__pathword__")
+                if pathword is not None:
+                    pathword = check_pathword[0][1]
+            except Exception:
+                print(f"无法读取数据库 {db_file.resolve().as_posix()}")
+                continue
 
-        if ret.status_code < 200 or ret.status_code > 299:
-            self.logger.error(f"{msg}请求失败 HTTP{ret.status_code}.")
-            raise ValueError
+            local_storage = Path(f"{self.download_root}/{name}")
+            if local_storage.exists():
+                size = f"{local_storage.stat().st_size / 1024} MiB"
+            else:
+                size = "无本地文件"
 
-        results = self._CheckApiResults(ret.json())
+            self.comics.append((pathword, f"{name} | {size}"))
+            continue
 
-        return results
+        return
 
-    def _CheckApiResults(self, j: dict) -> dict:
-        json_code: int | None = j.get("code")
-        json_results: dict | None = j.get("results")
-        if json_code is None or json_code != 200:
-            raise ValueError(f"请求错误 {json_code}: {j.get('message')}")
-        if json_results is None:
-            raise ValueError(f"JSON不存在路径[/results]")
-        return json_results
+    def ConvertIndex(self, cmd: str, num: str):
+        try:
+            index = int(num, 10)
 
-    def Search(self, kw: str) -> str | None:
-        results = self._ApiGet(
-            f"https://api.{self.host}/api/v3/search/comic?format=json&platform=3&q={kw}&limit=10&offset=0",
-            "",
-        )
-
-        json_results_list: List[dict] | None = results.get("list")
-        if json_results_list is None:
-            raise ValueError(f"JSON不存在路径[/results/list]")
-
-        if len(json_results_list) == 0:
-            self.logger.warn(f"未搜索到任何内容")
+        except Exception:
+            print(f" {cmd} 参数 index={num} 不是十进制数字.")
             return None
 
-        manga_list: List[str] = []
-        for i, item in enumerate(json_results_list):
-            name: str | None = item.get("name")
-            path_word: str | None = item.get("path_word")
-            author: dict | None = item.get("author")
+        if index < 0 or index >= len(self.comics):
+            print(f" {cmd} 参数 index={index} 索引值超出范围.")
+            return None
 
-            if None in [name, path_word, author]:
-                raise TypeError
+        return index
 
-            author_fmt: str = ""
-            for z in author if author else {}:
-                author_fmt += f"{f'{z.get("name")}'},"
-            author_fmt = author_fmt[:-1]
+    def _CopymangaIndex(self, i: int):
+        return self._CopymangaPathword(self.comics[i][0])
 
-            manga_list.append(path_word)  # type: ignore
-            self.logger.info(f"[{i}] ({name}/{path_word}) {{{author_fmt}}}")
+    def _CopymangaPathword(self, pathword: str):
+        return CopymangaObject(
+            download_root=self.download_root,
+            database_root=self.database_root,
+            pathword=pathword,
+            proxy=self.proxy,
+        )
 
-        index: int = 0
-        max_index = len(manga_list)
-        while True:
-            self.logger.info(f"选择搜索结果(int<={max_index - 1})=")
-            instr = input()
+    def _CopymangaKeyword(self, keyword: str):
+        return CopymangaObject(
+            download_root=self.download_root,
+            database_root=self.database_root,
+            keyword=keyword,
+            proxy=self.proxy,
+        )
+
+    def Cmd_All(self, argv: List[str], call):
+        cmd = argv[0]
+        index = argv[1]
+        if index == "all":
+            for pathword, _ in self.comics:
+                call(pathword)
+                print()
+            return
+        num = self.ConvertIndex(cmd, index)
+        if num is None:
+            return
+        call(self.comics[num][0])
+        return
+
+    def Cmd_Help(self, argv: List[str]):
+        self.ShowCommand(argv)
+
+    def Cmd_Update(self, argv: List[str]):
+        def Update(pathword: str):
+            comic = self._CopymangaPathword(pathword)
+            comic.ShowMetadate()
+            comic.UpdateAll(not_files=False)
+            return
+
+        return self.Cmd_All(argv, Update)
+
+    def Cmd_Download(self, argv: List[str]):
+        def Download(pathword: str):
+            server = aria2tool.Aria2Server("dl.nosync", 99)
+            server.Restart()
+            manger = dlmanager.CopymangaDLManger(
+                aria2tool.Aria2Client(server.Url(), server.Token()),
+                database.SqliteClient(self.database_root / Path(f"{pathword}.db")),
+                self.proxy,
+                self.download_root,
+                self.temp_root,
+            )
             try:
-                index = int(instr, 10)
-                if index < 0 and index >= max_index:
-                    raise ValueError
-            except Exception:
-                self.logger.warn(f"输入的格式不正确或序号超出范围.")
-                continue
-            break
+                manger.Run(auto_exit=True)
+            except Exception as e:
+                print(f"下载时发送错误: {e}")
+            finally:
+                server.Stop()
+            return
 
-        return manga_list[index]
+        return self.Cmd_All(argv, Download)
 
-    def _InitInfo(self, pathword: str):
-        results = self._ApiGet(
-            f"https://api.{self.host}/api/v3/comic2/{pathword}",
-            "",
-        )
+    def Cmd_Detect(self, argv: List[str]):
+        def Detect(pathword: str):
+            comic = self._CopymangaPathword(pathword)
+            comic.ShowMetadate()
+            comic.DetectFiles()
+            return
 
-        comic: dict | None = results.get("comic")
-        if comic is None:
-            raise ValueError(f"JSON不存在路径[/results/comic]")
+        return self.Cmd_All(argv, Detect)
 
-        manga = self.manga
-        manga.alias = str(comic.get("alias"))
-        manga.author = CopymangaItem.AuthorItem.FromMap(comic.get("author"))
-        manga.cover = str(comic.get("cover"))
-        manga.name = str(comic.get("name"))
-        manga.path_word = str(comic.get("path_word"))
-        status = comic.get("status")
-        manga.status = str(status.get("display") if status else None)
-        manga.uuid = str(comic.get("uuid"))
+    def Cmd_Check(self, argv: List[str]):
+        def Check(pathword: str):
+            comic = self._CopymangaPathword(pathword)
+            comic.ShowMetadate()
+            comic.CheckFiles()
+            return
 
-        groups: dict | None = results.get("groups")
-        if groups is None:
-            raise ValueError(f"JSON不存在路径[/results/groups]")
-        for i in groups.keys():
-            g_name: str | None = groups[i].get("name")
-            g_path: str | None = groups[i].get("path_word")
-            if g_path is None:
-                continue
-            group = CopymangaItem.GroupItem()
-            group.name = str(g_name)
-            group.path_word = str(g_path)
-            self.manga.groups.append(group)
+        return self.Cmd_All(argv, Check)
 
+    def Cmd_Mark(self, argv: List[str]):
+        num = self.ConvertIndex(argv[0], argv[1])
+        if num is None:
+            return
+        comic = self._CopymangaIndex(num)
+        comic.ShowMetadate()
+        comic.CheckFiles(mark_removed_file=True)
         return
 
-    def ShowMangaInfo(self):
-        manga = self.manga
-        self.logger.info(f"漫画 {manga.path_word} 信息")
-        self.logger.info(f"| 页面 -> https://{self.host}/comic/{manga.path_word} ")
-        self.logger.info(f"| 名称 {manga.name} ")
-        self.logger.info(f"| 作者 {manga.FormatAuthor()}")
-        self.logger.info(f"| 标识 {manga.status} {manga.uuid}")
-        self.logger.info(f"| 数据库 {manga.path_word}.db")
-        for index, group in enumerate(manga.groups):
-            self.logger.info(f"| 分组{index} {group.name}")
+    def Cmd_Show(self, argv: List[str]):
+        num = self.ConvertIndex(argv[0], argv[1])
+        if num is None:
+            return
+        comic = self._CopymangaIndex(num)
+        comic.ShowMetadate()
+        comic.UpdateAll(not_files=True)
         return
 
-    def _UpdatGroup(self, group: CopymangaItem.GroupItem, limit: int = 100) -> List[dict]:
-        offset = 0
-        chapters: List[dict] = []
-        while True:
-            results = self._ApiGet(
-                f"https://api.{self.host}/api/v3/comic/{self.manga.path_word}/group/{group.path_word}/chapters"  #
-                + f"?limit={limit}&offset={offset}&platform=3",
-                "",
-            )
-
-            results_list = results.get("list")
-            if results_list is None:
-                raise ValueError(f"JSON不存在路径[/results/comic]")
-            results_total = results.get("total")
-            if results_total is None:
-                raise ValueError(f"JSON不存在路径[/results/total]")
-
-            chapters += results_list
-            offset += limit
-
-            if len(chapters) >= int(results_total):
-                break
-
-            continue
-
-        return chapters
-
-    def UpdateAllGroup(self):
-        for group in self.manga.groups:
-            results_list = self._UpdatGroup(group)
-            group.chapters.clear()
-            for chapter_json in results_list:
-                chapter = CopymangaItem.ChapterItem()
-                chapter.name = str(chapter_json.get("name"))
-                chapter.uuid = str(chapter_json.get("uuid"))
-                chapter.size = int(str(chapter_json.get("size")), 10)  # type: ignore
-                chapter.index = int(str(chapter_json.get("index")), 10)  # type: ignore
-                chapter.comic_id = str(chapter_json.get("comic_id"))
-                chapter.comic_path_word = str(chapter_json.get("comic_path_word"))
-                chapter.group_id = str(chapter_json.get("group_id"))
-                chapter.group_path_word = str(chapter_json.get("group_path_word"))
-                chapter.datetime_created = str(chapter_json.get("datetime_created"))
-                chapter.prev_uuid = str(chapter_json.get("prev"))
-                chapter.next_uuid = str(chapter_json.get("next"))
-                group.chapters.append(chapter)
-                continue
-            continue
+    def Cmd_DeleteDatabase(self, argv: List[str]):
+        num = self.ConvertIndex(argv[0], argv[1])
+        if num is None:
+            return
+        comic = self._CopymangaIndex(num)
+        check_delete = input(f"删除 {comic.database} 数据库文件 输入[Yes]确认操作(区分大小写)=")
+        if check_delete == "Yes":
+            db = comic.database.GetFilePath()
+            print(f'保留本地目录 "{(self.download_root / Path(comic.comic.name)).as_posix()}"')
+            del comic
+            db.unlink()
+        else:
+            print(f"取消删除数据库")
         return
 
-    def ShowGroupInfo(self):
-        manga_file_count = 0
-        for group in self.manga.groups:
-            self.logger.info(f"分组 {group.name} 共 {len(group.chapters)} 章节")
-            group_file_count = 0
-            for chapter in group.chapters:
-                self.logger.info(f"| {str(chapter.index).zfill(3)}. {chapter.name}({chapter.size})")
-                group_file_count += chapter.size
-                continue
-            manga_file_count += group_file_count
-            self.logger.info(f"| 共 {group_file_count} 个文件")
-            continue
-        self.logger.info(f"所有分组共 {manga_file_count} 个文件")
+    def Cmd_Search(self, argv: List[str]):
+        cmd = argv[1]
+        keyword = argv[1]
+        if len(keyword) == 0:
+            print(f" {cmd} keyword为空 未输入任何关键词.")
+            return
+        comic = self._CopymangaKeyword(keyword)
+        print(f"初始化数据库 {comic.comic.name} / {comic.comic.path_word} ")
         return
 
-    def StartDownload(self):
-        MultiCurl(
-            self.database,
-            "" if self.proxy is None else self.proxy["https"],
-        ).Run()
-        self.logger.info(f"下载完成")
-
-    def _DownloadChapter(self, chapter: CopymangaItem.ChapterItem) -> int:
-        results = self._ApiGet(
-            f"https://api.{self.host}/api/v3/comic/{self.manga.path_word}/chapter2/{chapter.uuid}",
-            "   ",
-        )
-
-        session = Session(self.database.engine)
-        FileTableItem = MangaLocalDatabase.FileTableItem
-        MetadataTableItem = MangaLocalDatabase.MetadataTableItem
-
-        # 未在数据库中标记获取完成的章节
-
-        results_chapter = results.get("chapter")
-        if results_chapter is None:
-            raise ValueError(f"JSON不存在路径[/results/chapter]")
-
-        chapter_contents: List[dict] | None = results_chapter.get("contents")
-        if chapter_contents is None:
-            raise ValueError(f"JSON不存在路径[/results/chapter/contents]")
-        chapter_words: List[int] | None = results_chapter.get("words")
-        if chapter_words is None:
-            raise ValueError(f"JSON不存在路径[/results/chapter/words]")
-
-        for page, url in sorted(zip(chapter_words, chapter_contents)):
-            url = str(url.get("url"))
-            filetype = url[url.rfind(".") + 1 :]
-            basepath = f"{self.manga.name}"
-            filename = f"{chapter.name}-{str(page).zfill(3)}.{filetype}"
-
-            items = session.scalars(
-                select(
-                    FileTableItem,
-                ).where(FileTableItem.filename == filename),
-            ).all()
-
-            if len(items) == 1:
-                item = items[0]
-                item.url = url
-                self.logger.info(f" ~ {str(page).zfill(3)} 更新({str(item.index).zfill(5)} -> {item.basepath}/{item.filename} -> {item.url})")
-                continue
-
-            if len(items) != 0:
-                for item in items:
-                    session.delete(item)
-                    self.logger.info(f" - {str(page).zfill(3)} 移除({str(item.index).zfill(5)} -> {item.basepath}/{item.filename})")
-
-            item = FileTableItem.Create(
-                filename,
-                basepath,
-                url,
-            )
-            session.add(item)
-            session.flush()
-
-            self.logger.info(f" + {str(page).zfill(3)} 文件({str(item.index).zfill(5)} -> {item.basepath}/{item.filename} -> {item.url})")
-            continue
-
-        session.commit()
-
-        self.logger.info(f" = 总文件数 {len(chapter_contents)}")
-
-        self.StartDownload()
-
-        # 获取完成下载的章节写入数据库标记
-
-        session.add(
-            MetadataTableItem.Create(
-                "chapter",
-                chapter.name,
-                "",
-                255,
-            )
-        )
-        session.flush()
-        session.commit()
-
-        session.close()
-        return len(chapter_contents)
-
-    def DownloadAllChapters(self) -> None:
-        total_files = 0
-
-        session = Session(self.database.engine)
-        MetadataTableItem = MangaLocalDatabase.MetadataTableItem
-
-        for group in self.manga.groups:
-            #
-            self.logger.info(f"下载分组 {group.name} 中 {len(group.chapters)} 个章节")
-
-            for index, chapter in enumerate(group.chapters):
-                # 检查章节是否下载
-                items = session.scalars(
-                    select(
-                        MetadataTableItem,
-                    )
-                    .where(MetadataTableItem.name == "chapter")
-                    .where(MetadataTableItem.context == chapter.name),
-                ).all()
-                # 所有文件已经下载完成
-                if len(items) == 1:
-                    local_count = len(list(self.local_storage.rglob(f"{chapter.name}-*.webp")))
-                    loss_count = chapter.size - local_count
-                    if loss_count == 0:
-                        self.logger.info(f"| [{str(index).zfill(4)}] 章节({chapter.name}) 已标记下载 本地文件数量({local_count})")
-                    else:
-                        self.logger.warn(f"| [{str(index).zfill(4)}] 章节({chapter.name}) 已标记下载 本地文件缺失({loss_count}/{local_count})")
-                    continue
-                # 数据库错误
-                elif len(items) != 0:
-                    self.logger.error(f"| [{str(index).zfill(4)}] 章节({chapter.name})拥有多个下载标记.")
-                    raise ValueError(f"数据库章节标记重复")
-
-                # 未下载
-                self.logger.info(f"| [{str(index).zfill(4)}] 下载章节({chapter.name})")
-                total_files += self._DownloadChapter(chapter)
-
-                continue
-
-            self.logger.info(f"| 新增下载任务 {total_files} 个文件")
-            continue
-
-        session.close()
+    def Cmd_Init(self, argv: List[str]):
+        cmd = argv[1]
+        pathword = argv[1]
+        if len(pathword) == 0:
+            print(f" {cmd} pathword为空 未输入任何关键词.")
+            return
+        comic = self._CopymangaPathword(pathword)
+        print(f"初始化数据库 {comic.comic.name} / {comic.comic.path_word} ")
         return
 
-    def CheckLocalFile(self, mark_removed_file: bool = False):
-        session = Session(self.database.engine)
-        TableItem = MangaLocalDatabase.FileTableItem
+    def Cmd_Clear(self, argv: List[str]):
+        os.system("cls")
 
-        items: Sequence[MangaLocalDatabase.FileTableItem] = session.scalars(
-            select(
-                TableItem,
-            ).where(TableItem.status == 255),
-        ).all()
+    def Cmd_Exit(self, argv: List[str]):
+        self.exit_status = True
 
-        self.logger.info(f"检查被记录的 {len(items)} 个本地文件")
-
-        for i, item in enumerate(items):
-            fullpath = Path(f"./dl.nosync/{item.basepath}/{item.filename}")
-            if fullpath.exists():
-                continue
-            if mark_removed_file:
-                self.logger.warn(f"文件丢失 {fullpath.as_posix()} 标记不下载")
-                item.status = -1
-                continue
-            self.logger.warn(f"文件丢失 {fullpath.as_posix()} 将标记为未下载")
-            item.status = 0
-            continue
-
-        session.commit()
-
-        self.logger.info(f"本地文件检查完成")
-
-        session.close()
-        return
-
-    def UpdateAndDownload(self):
-        self.ShowMangaInfo()
-        self.UpdateAllGroup()
-        self.ShowGroupInfo()
-        self.DownloadAllChapters()
-        self.CheckLocalFile()
-
-
-def Console():
-    manga_list = [
-        # ("request:copymanga-manga-id", "optional:display-name"),
-    ]
-
-    def PrintList(manga_list: list):
+    def ShowCommand(self, argv: List[str] | None = None):
         print()
-        for i, data in enumerate(manga_list):
+        print(self.commands_str)
+
+    def ShowComics(self, argv: List[str] | None = None):
+        print()
+        self.ScanComics()
+
+        if len(self.comics) == 0:
+            print("[ 无漫画 ]")
+            return
+
+        for i, data in enumerate(self.comics):
             path_word = data[0]
             manga_name = data[1]
-            print(f"{str(i).zfill(2)}. [ {manga_name} / {path_word} ] ")
-
-    PrintList(manga_list)
-
-    max_index = len(manga_list)
-    if max_index == 0:
+            print(f"{str(i).zfill(2)}. [ {manga_name} | {path_word} ] ")
+            
+        print()
         return
 
-    while True:
-        user_in = input("\n命令[索引值 update/show/check/download/mark]: ")
-        cmd = user_in.split(" ")
-        if len(cmd) != 2:
-            PrintList(manga_list)
-            continue
+    def Run(self):
+        self.ShowComics()
+        self.ShowCommand()
+        self.exit_status = False
 
-        index = 0
-        index_str = cmd[0]
-        do_str = cmd[1]
-
-        select_all = True if index_str == "all" else False
-
-        if select_all is False:
-            try:
-                index = int(index_str, 10)
-                if index >= max_index:
-                    print(f"索引值只能在[0-{max_index - 1}]范围内.")
-            except Exception:
-                print("索引值只能是[可选的整数]或[all].")
-                continue
-
-        if select_all:
-            match do_str:
-                case "update":
-                    for pathname, _ in manga_list:
-                        task = CopymangaTask(pathname)
-                        task.UpdateAndDownload()
-                case _:
-                    print("不支持的操作.")
+        def Loop():
+            while not self.exit_status:
+                input_str = input("> ")
+                if len(input_str) == 0:
                     continue
-            print("更新全部漫画完成.")
-            continue
-
-        task = CopymangaTask(manga_list[index][0])
-
-        match do_str:
-            case "update":
-                task.UpdateAndDownload()
+                argv = input_str.split()
+                cmd = argv[0]
+                detail = self.commands.get(cmd)
+                if detail is None:
+                    print(f' 未知命令 "{cmd}" .')
+                    continue
+                if len(argv) != detail.GetArgc():
+                    print(f" 命令 {cmd} 参数不正确.")
+                    continue
+                detail.call(argv)
                 continue
 
-            case "show":
-                task.ShowMangaInfo()
-                task.UpdateAllGroup()
-                task.ShowGroupInfo()
+        while not self.exit_status:
+            try:
+                Loop()
+            except KeyboardInterrupt:
+                print("\n用户中断操作 双击Ctrl+C退出")
+                time.sleep(1)
                 continue
-
-            case "check":
-                task.CheckLocalFile()
-                continue
-
-            case "download":
-                task.StartDownload()
-                continue
-
-            case "mark":
-                task.CheckLocalFile(True)
-                continue
-
-            case _:
-                print("不支持的操作.")
-                continue
-
-        continue
-
-    return
+            except Exception as e:
+                print(f"错误：{e}")
 
 
 if __name__ == "__main__":
-    Console()
+    os.system("cls")
+    os.system("chcp 65001")
 
+    try:
+        Console(
+            TEMP_ROOT,
+            DOWNLOAD_ROOT,
+            DB_ROOT,
+            PROXY,
+        ).Run()
+    except KeyboardInterrupt:
+        exit()
+    except Exception:
+        raise Exception

@@ -227,7 +227,8 @@ _sinks = [
     # LoggerUtil.DailyFileSink("default.log"),
 ]
 
-logger = LoggerUtil.Logger("default", _sinks)
+Logger = LoggerUtil.Logger
+logger = Logger("default", _sinks)
 
 
 def main():
