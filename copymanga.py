@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import datetime
@@ -7,10 +8,6 @@ import threading
 from typing import Dict, List, Optional, Sequence, Tuple
 from pathlib import Path
 from pydantic import BaseModel
-
-
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 import database
 import spdlogger
@@ -272,15 +269,15 @@ class ApiGetFiles(BaseModel):
 
 class ComicFilePath:
     @staticmethod
-    def BeginsAtDownloadDir(download: str, comic: str, group: str, index: int, chapter: str, page: str | int, ext: str):
-        return f"{download}/{ComicFilePath.BeginsAtComicDir(comic, group, index, chapter, page, ext)}"
+    def AtWorkDir(download: str, comic: str, group: str, index: int, chapter: str, page: str | int, ext: str):
+        return f"{download}/{ComicFilePath.AtComicDir(comic, group, index, chapter, page, ext)}"
 
     @staticmethod
-    def BeginsAtComicDir(comic: str, group: str, index: int, chapter: str, page: str | int, ext: str):
-        return f"{comic}/{ComicFilePath.BeginsAtGroupDir(group, index, chapter, page, ext)}"
+    def AtComicDir(comic: str, group: str, index: int, chapter: str, page: str | int, ext: str):
+        return f"{comic}/{ComicFilePath.AtDownloadDir(group, index, chapter, page, ext)}"
 
     @staticmethod
-    def BeginsAtGroupDir(group: str, index: int, chapter: str, page: str | int, ext: str):
+    def AtDownloadDir(group: str, index: int, chapter: str, page: str | int, ext: str):
         if isinstance(page, int):
             page_str = f"{page:03d}"
         elif page == "*":
@@ -290,8 +287,8 @@ class ComicFilePath:
         return f"{group}/{index:04d}.{chapter}-{page_str}.{ext}"
 
     @staticmethod
-    def FromOrmGroupDir(file: database.TableFiles):
-        return ComicFilePath.BeginsAtGroupDir(
+    def AtDownloadDir_ORM(file: database.FileORM):
+        return ComicFilePath.AtDownloadDir(
             file.group,
             file.api_index,
             file.chapter,
@@ -345,8 +342,7 @@ class CopymangaObject:
         if pathword is None and isinstance(keyword, str):
             init_pathword = self.Search(keyword)
             if init_pathword is None:
-                self.logger.warn(f"未搜索到任何内容")
-                raise ValueError("无法从关键词初始化对象")
+                raise ValueError(f"关键词(keyword={keyword})未搜索到任何内容")
 
         # 如果用 漫画ID 为参数
         elif keyword is None and isinstance(pathword, str):
@@ -354,14 +350,12 @@ class CopymangaObject:
 
         # 构造参数不正确
         else:
-            self.logger.error(f"初始化参数错误 pathword=[{pathword}] keyword=[{keyword}]")
-            raise ValueError("对象初始化参数错误")
+            raise ValueError(f"初始化参数错误 pathword=[{pathword}] keyword=[{keyword}]")
 
         # 获取 漫画信息
         data = self.GetInfo(init_pathword)
         if data is None:
-            self.logger.error(f"输入的漫画(id={pathword})不存在")
-            raise ValueError("无法从关路径词初始化对象")
+            raise ValueError(f"路径词(pathword={pathword})不存在")
 
         self.data = data
 
@@ -371,8 +365,8 @@ class CopymangaObject:
         # 初始化 漫画本地数据库和目录
         self.download_folder = download_root / Path(self.data.comic.name)
         self._db_file = database_root / Path(f"{self.data.comic.path_word}.db")
-        self.database = database.SqliteClient(self._db_file)
-        self._CheckBaseMetadata()
+        self.database = database.ComicDatabase(self._db_file)
+        self._CheckMetadata()
 
         return
 
@@ -387,26 +381,26 @@ class CopymangaObject:
             try:
                 self.lock.CountAdd()
                 self.logger.debug(f"{msg}请求 {url} 请求数({self.lock})")
-                ret = requests.get(url, headers=self.header, proxies=self.proxy)
+                r = requests.get(url, headers=self.header, proxies=self.proxy)
+
+                if r.status_code < 200 or r.status_code > 299:
+                    raise ConnectionError(f"{msg}请求失败 HTTP {r.status_code}")
 
             except Exception as e:
                 err += 1
                 self.logger.warn(f"{msg}重试第 {err} 次")
                 self.logger.warn(f"{msg}| {e}")
                 time.sleep(1)
+                if err > 5:
+                    raise ConnectionError(f"{msg}无法请求 {url} ")
                 continue
 
-            if err > 4:
-                self.logger.error(f"{msg}无法请求 {url}")
-                raise ConnectionError
-
-            if ret.status_code < 200 or ret.status_code > 299:
-                self.logger.error(f"{msg}请求失败 HTTP{ret.status_code}")
-                raise ValueError
-
-            throttled_sec = self.Throttled(ret.json())
+            throttled_sec = self.CheckThrottled(r.json())
 
             if throttled_sec is None:
+                if r.json().get("results") is None:
+                    self.logger.error(f"{msg}结构错误 {r.json()}")
+                    continue
                 break
 
             throttled_sec += 5
@@ -416,24 +410,24 @@ class CopymangaObject:
             self.lock.Reset()
             continue
 
-        results = self.GetResults(ret.json())
+        results = self.GetResults(r.json())
 
         return results
 
-    def Throttled(self, j: dict):
+    def CheckThrottled(self, j: dict):
         code = j.get("code")
         if code is None:
-            raise ValueError(f"不支持的消息: 无[/code] {j}")
+            raise ValueError(f"无[/code] {j}")
         if code != 210:
             return None
         message = j.get("message", "")
         if message is None:
-            return None
+            raise ValueError(f"无[/message] {j}")
         if not ("throttled" in message and "seconds" in message):
-            return None
+            raise ValueError(f"无法匹配特征 {j}")
         m = re.findall(r"\d+", message)
         if len(m) != 1:
-            return None
+            raise ValueError(f"无法提取时间 {j}")
         return int(m[0], 10)
 
     def GetResults(self, j: dict) -> dict:
@@ -445,45 +439,24 @@ class CopymangaObject:
             raise ValueError(f"JSON不存在路径[/results]")
         return json_results
 
-    @staticmethod
-    def SetMetadata(manga_db: database.SqliteClient, tag: str, context: str, status: int):
-        Table = database.TableMetadata
-        with Session(manga_db.engine) as session:
-            item = Table.Create(tag, context, status)
-            session.add(item)
-            session.flush()
-            session.commit()
+    def _CheckMetadata(self, override: bool = False):
+        if override or self.database.attribute.GetName() is None:
+            self.database.attribute.SetName(self.data.comic.name)
 
-        return
+        if override or self.database.attribute.GetPathword() is None:
+            self.database.attribute.SetPathword(self.data.comic.path_word)
 
-    @staticmethod
-    def GetMetadata(manga_db: database.SqliteClient, tag: str):
-        r: List[Tuple[str, str, int]] = []
-        Table = database.TableMetadata
-        with Session(manga_db.engine) as session:
-            items = session.scalars(
-                select(
-                    Table,
-                ).where(Table.tag == tag),
-            ).all()
-            for item in items:
-                r.append((item.tag, item.context, item.status))
+        for group in self.groups.values():
+            name = group.name
+            pathword = group.path_word
+            check = self.database.group.SelectName(name)
+            if check is not None:
+                if override is False:
+                    continue
+                self.database.group.AddName(name, pathword)
                 continue
-            pass
-        return r
-
-    def _CheckBaseMetadata(self):
-        check_name = self.GetMetadata(self.database, "__name__")
-        if len(check_name) == 0:
-            self.SetMetadata(self.database, "__name__", self.data.comic.name, 0)
-        elif len(check_name) != 1:
-            raise ValueError(f"数据库错误 漫画被记录多个名称")
-
-        check_pathword = self.GetMetadata(self.database, "__pathword__")
-        if len(check_pathword) == 0:
-            self.SetMetadata(self.database, "__pathword__", self.data.comic.path_word, 0)
-        elif len(check_pathword) != 1:
-            raise ValueError(f"数据库错误 漫画被记录多个ID")
+            self.database.group.AddName(name, pathword)
+            continue
 
         return
 
@@ -520,9 +493,10 @@ class CopymangaObject:
             try:
                 index = int(instr, 10)
                 if index < 0 and index >= max_index:
-                    raise ValueError
+                    self.logger.warn(f"输入超出范围.")
+                    continue
             except Exception:
-                self.logger.warn(f"输入的格式不正确或序号超出范围.")
+                self.logger.warn(f"输入的格式不正确.")
                 continue
             break
 
@@ -611,58 +585,43 @@ class CopymangaObject:
             group: ApiGetComic.Results.GroupsMetadata,
             chapter: ApiGetChapters.Results.ChaptersMetadata,
         ) -> bool:
-            TableChapters = database.TableChapters
-            with Session(self.database.engine) as session:
-                items = session.scalars(
-                    select(
-                        TableChapters,
-                    ).where(TableChapters.uuid == chapter.uuid)
-                ).all()
+            orm_chapter = self.database.chapter.SelectUUID(chapter.uuid)
 
-                # 章节 已完成
-                if len(items) == 1:
-                    local_files = list(
-                        self.download_folder.glob(
-                            ComicFilePath.BeginsAtGroupDir(group.name, chapter.index, chapter.name, "*", "*"),
-                        )
-                    )
+            # 章节 已完成
+            if orm_chapter is None:
+                return False
 
-                    # 检查 本地文件数量
-                    local_cont = len(local_files)
-                    loss_count = chapter.size - local_cont
+            # 检查 本地文件数量
+            local_files = self.download_folder.glob(
+                ComicFilePath.AtDownloadDir(
+                    group.name,
+                    chapter.index,
+                    chapter.name,
+                    "*",
+                    "*",
+                ),
+            )
 
-                    if loss_count == 0:
-                        self.logger.info(f"| 文件完整 {chapter.size:03d} [{items[0].index:03d}] {chapter.name}")
-                    else:
-                        self.logger.info(f"| 文件缺少 {chapter.size - local_cont:03d} 个 [{items[0].index:03d}] {chapter.name}")
+            local_count = len(list(local_files))
+            loss_count = chapter.size - local_count
 
-                    return True
+            if loss_count == 0:
+                self.logger.info(f"| 文件完整 {chapter.size:03d} [{orm_chapter.index:03d}] {chapter.name}")
+            else:
+                self.logger.info(f"| 文件缺少 {chapter.size - local_count:03d} 个 [{orm_chapter.index:03d}] {chapter.name}")
 
-                # 章节 重复记录
-                elif len(items) != 0:
-                    for item in items:
-                        session.delete(item)
-                        self.logger.warn(f"| [{item.index:03d}]  {chapter.name} 章节重复记录 已被移除")
-                    return False
-
-                # 章节 未被记录
-                pass
-
-            return False
+            return True
 
         # ================================================================================================================================
 
         def InsertFile(
-            session: Session,
             group: ApiGetComic.Results.GroupsMetadata,
             chapter: ApiGetChapters.Results.ChaptersMetadata,
             page: int,
             url: str,
         ) -> int:
-            TableFile = database.TableFiles
-
             extension = url[url.rfind(".") + 1 :]
-            fullpath = ComicFilePath.BeginsAtGroupDir(
+            fullpath = ComicFilePath.AtDownloadDir(
                 group.name,
                 chapter.index,
                 chapter.name,
@@ -670,48 +629,43 @@ class CopymangaObject:
                 extension,
             )
 
-            items = session.scalars(
-                select(TableFile)
-                .where(TableFile.group == group.name)
-                .where(TableFile.chapter == chapter.name)
-                .where(TableFile.page == page)
-                .where(TableFile.extension == extension),
-            ).all()
+            orm_file = self.database.file.SelectPage(
+                group.name,
+                chapter.name,
+                page,
+            )
 
             # 文件 更新URL
-            if len(items) == 1:
-                item = items[0]
-                item.dl_url = url
-                session.commit()
-                self.logger.debug(f"|   更新文件 {items[0].index:04d} {fullpath} {item.dl_url}")
-                return item.index
-
-            # 文件 重复任务
-            elif len(items) != 0:
-                for item in items:
-                    session.delete(item)
-                    self.logger.warn(f"|   移除文件 {item.index:04d} {fullpath} {item.dl_url}")
-                pass
+            if orm_file is not None:
+                if orm_file.dl_skip:
+                    self.logger.debug(f"|   跳过更新 {orm_file.index:04d} {fullpath}")
+                    return orm_file.index
+                orm_file.dl_url = url
+                orm_file.extension = extension
+                orm_file.dl_status = database.File.DlStatus.Update
+                self.database.Commit()
+                self.logger.debug(f"|   更新文件 {orm_file.index:04d} {fullpath} {orm_file.dl_url}")
+                return orm_file.index
 
             # 文件 无任务
-            item = TableFile.Create(
-                api_index=chapter.index,
-                group=group.name,
-                chapter=chapter.name,
-                page=page,
-                extension=extension,
-                dl_path=comic.name,
-                dl_url=url,
-                dl_skip=False,
-                dl_status=database.FileDlStatus.NewFile,
-                status=0,
-            )
-            session.add(item)
-            session.flush()
-            session.commit()
 
-            self.logger.info(f"|   记录文件 {item.index:04d} + {fullpath}")
-            return item.index
+            orm_file = self.database.file.AddPage(
+                group.name,
+                chapter.name,
+                page,
+                database.FileOptional(
+                    api_index=chapter.index,
+                    extension=extension,
+                    dl_path=comic.name,
+                    dl_url=url,
+                    dl_skip=False,
+                    dl_status=database.File.DlStatus.Wait,
+                    status=0,
+                ),
+            )
+
+            self.logger.info(f"|   记录文件 {orm_file.index:04d} + {fullpath}")
+            return orm_file.index
 
         # ================================================================================================================================
 
@@ -720,28 +674,25 @@ class CopymangaObject:
             chapter: ApiGetChapters.Results.ChaptersMetadata,
             files: Dict[int, str],
         ) -> int:
-            TableChapters = database.TableChapters
+            # 记录文件
+            for page in files.keys():
+                url = files[page]
+                InsertFile(group, chapter, page, url)
+                continue
 
-            with Session(self.database.engine) as session:
-                # 记录文件
-                for page in files.keys():
-                    url = files[page]
-                    InsertFile(session, group, chapter, page, url)
-                    continue
-                # 标记章节完成
-                item = TableChapters.Create(
+            # 标记章节完成
+            orm_chapter = self.database.chapter.AddName(
+                group.name,
+                chapter.name,
+                database.ChapterOptional(
                     api_index=chapter.index,
-                    group=group.name,
-                    name=chapter.name,
                     size=chapter.size,
                     uuid=chapter.uuid,
                     status=0,
-                )
-                session.add(item)
-                session.flush()
-                session.commit()
+                ),
+            )
 
-                self.logger.info(f"|   完成章节 {item.index:04d}")
+            self.logger.info(f"|   [{orm_chapter.index:04d}] 完成")
 
             return len(files)
 
@@ -803,86 +754,53 @@ class CopymangaObject:
         return
 
     def DetectFiles(self):
-        Table = database.TableFiles
-        with Session(self.database.engine) as session:
-            items = session.scalars(
-                select(Table),
-            ).all()
-
-            self.logger.info(f"检查所有 {len(items)} 个文件的完成状态")
-
-            for item in items:
-                filepath = self.download_folder / ComicFilePath.BeginsAtGroupDir(
-                    item.group,
-                    item.index,
-                    item.chapter,
-                    item.page,
-                    item.extension,
-                )
-
-                if not filepath.exists():
-                    continue
-
-                self.logger.info(f'| 标记 {item.index:04d} "{filepath.as_posix()}" 为已下载')
-                item.dl_status = database.FileDlStatus.Completed
-                session.commit()
+        items = self.database.file.GetAll(database.FileOptional())
+        self.logger.info(f"检查所有 {len(items)} 个文件的完成状态")
+        for item in items:
+            filepath = self.download_folder / ComicFilePath.AtDownloadDir(
+                item.group,
+                item.index,
+                item.chapter,
+                item.page,
+                item.extension,
+            )
+            if not filepath.exists():
                 continue
-            pass
+            self.logger.info(f'| 标记 {item.index:04d} "{filepath.as_posix()}" 为已下载')
+            item.dl_status = database.File.DlStatus.Completed
+            self.database.Commit()
+            continue
         self.logger.info(f"文件检查完成")
         return
 
     def CheckFiles(self, mark_removed_file: bool = False):
-        Table = database.TableFiles
-
-        with Session(self.database.engine) as session:
-            # ================================================================================================================================
-
-            items = session.scalars(
-                select(Table)
-                .where(Table.dl_skip == False)  # noqa: E712
-                .where(Table.dl_status == database.FileDlStatus.Completed),
-            ).all()
-
-            self.logger.info(f"检查已完成的 {len(items)} 个文件")
-
-            for item in items:
-                filepath = self.download_folder / ComicFilePath.FromOrmGroupDir(item)
-
-                if filepath.exists():
-                    continue
-
-                if mark_removed_file:
-                    self.logger.warn(f'| 文件丢失 "{filepath.as_posix()}" 将标记为跳过下载')
-                    item.dl_skip = True
-                    session.commit()
-                    continue
-
-                self.logger.warn(f'| 文件丢失 "{filepath.as_posix()}" 将标记为未下载')
-                item.dl_status = 0
-                session.commit()
+        items = self.database.file.All_Completed_DlStatus()
+        self.logger.info(f"检查已完成的 {len(items)} 个文件")
+        for item in items:
+            filepath = self.download_folder / ComicFilePath.AtDownloadDir_ORM(item)
+            if filepath.exists():
                 continue
+            if mark_removed_file:
+                self.logger.warn(f'| 文件丢失 "{filepath.as_posix()}" 将标记为跳过下载')
+                item.dl_skip = True
+                self.database.Commit()
+                continue
+            self.logger.warn(f'| 文件丢失 "{filepath.as_posix()}" 将标记为未下载')
+            item.dl_status = 0
+            self.database.Commit()
+            continue
 
-            # ================================================================================================================================
+        items = self.database.file.All_Active_DlStatus()
+        self.logger.info(f"未完成共 {len(items)} 个文件")
+        items = self.database.file.All_Wait_DlStatus()
 
-            items = session.scalars(
-                select(Table)
-                .where(Table.dl_skip == False)  # noqa: E712
-                .where(Table.dl_status == database.FileDlStatus.Active),
-            ).all()
+        self.logger.info(f"未开始共 {len(items)} 个文件")
+        items = self.database.file.All_Error_DlStatus()
 
-            self.logger.info(f"未完成下载共 {len(items)} 个文件")
-
-            # ================================================================================================================================
-
-            items = session.scalars(
-                select(Table)
-                .where(Table.dl_skip == False)  # noqa: E712
-                .where(Table.dl_status == database.FileDlStatus.NewFile),
-            ).all()
-
-            self.logger.info(f"未开始共 {len(items)} 个文件")
-
-            # ================================================================================================================================
+        self.logger.info(f"错误共 {len(items)} 个文件")
+        for item in items:
+            filepath = self.download_folder / ComicFilePath.AtDownloadDir_ORM(item)
+            self.logger.warn(f'| 文件错误 "{filepath.as_posix()}" 将标记为未下载')
 
         self.logger.info(f"文件检查完成")
         return
@@ -925,18 +843,14 @@ def module_test():
     # obj.ShowMetadate()
     # obj.UpdateAll(not_files=True)
 
+    os.system("cls")
+    os.system("chcp 65001")
+
     print("\n")
     print("测试 更新漫画所有分组")
     obj = CopymangaObject(download_root=DOWNLOAD_ROOT, database_root=DB_ROOT, pathword="silentwitchchenmodemonvdemimi", proxy=win32proxy().get_proxy())
     obj.ShowMetadate()
     obj.UpdateAll()
-    num = 0
-    while True:
-        print(num)
-
-        obj.Get(f"https://api.{obj.host}/api/v3/search/comic?format=json&platform=3&q=沉默魔女&limit=10&offset=0", "")
-
-        num += 1
 
 
 if __name__ == "__main__":

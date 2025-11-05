@@ -5,9 +5,6 @@ from pathlib import Path
 import time
 from typing import List, Optional, Sequence, Tuple
 
-from sqlalchemy import inspect, types, select
-from sqlalchemy.orm import Session, DeclarativeBase, Mapped, mapped_column
-
 import database
 import aria2tool
 
@@ -18,12 +15,15 @@ from copymanga import ComicFilePath
 logger = spdlogger.logger
 
 
-def ClearDir(path: Path) -> None:
+def ClearDir(path: Path) -> int:
+    remove_count = 0
     for item in path.iterdir():
         if item.is_file():
             item.unlink()
+            remove_count += 1
         else:
-            ClearDir(item)
+            remove_count += ClearDir(item)
+    return remove_count
 
 
 class RequsetCountLock:
@@ -113,7 +113,7 @@ class Task:
     def GetTempFullPath(self):
         return self.temp_dir / self.filepath
 
-    def LoadOrmFile(self, obj: database.TableFiles):
+    def LoadOrmFile(self, obj: database.FileORM):
         if self.gid is not None:
             self.Stop()
 
@@ -124,7 +124,7 @@ class Task:
             return Task.LOAD_Error_InvalidUrl
 
         # 获取文件相对下载路径
-        self.filepath = Path(ComicFilePath.FromOrmGroupDir(obj))
+        self.filepath = Path(ComicFilePath.AtDownloadDir_ORM(obj))
 
         # 检查文件
         checkfile = self.GetSaveFullPath()
@@ -203,7 +203,7 @@ class CopymangaDLManger:
     def __init__(
         self,
         aria2_client: aria2tool.Aria2Client,
-        sql_client: database.SqliteClient,
+        sql_client: database.ComicDatabase,
         proxy: Optional[str],
         download_dir: Path,
         temp_dir: Path,
@@ -216,34 +216,18 @@ class CopymangaDLManger:
         self.lock = globle_download_request_lock
 
         self.aria2_client = aria2_client
-        self.sql_client = sql_client
+        self.database = sql_client
 
         self.thread_exit: bool = False
 
-        Table = database.TableMetadata
-        with Session(self.sql_client.engine) as session:
-            self.name = (
-                session.scalars(
-                    select(Table).where(Table.tag == "__name__"),
-                )
-                .one()
-                .context
-            )
-            self.pathwordname = (
-                session.scalars(
-                    select(Table).where(Table.tag == "__pathword__"),
-                )
-                .one()
-                .context
-            )
-
+        self.name = self.database.attribute.GetName()
+        self.pathwordname = self.database.attribute.GetPathword()
+            
         self.temp_dir = temp_dir / Path(self.name)
         self.download_dir = download_dir / Path(self.name)
 
-        self.logger.info(f"初始化下载管理器 {aria2_client.rpc} {aria2_client.token} ")
-        self.logger.debug(f'temp -> "{self.temp_dir.as_posix()}"')
-        self.logger.debug(f'save -> "{self.download_dir.as_posix()}"')
-        self.logger.debug(f"清理缓存目录...")
+        self.logger.debug(f'缓存目录 = "{self.temp_dir.as_posix()}"')
+        self.logger.debug(f'下载目录 = "{self.download_dir.as_posix()}"')
 
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.download_dir.mkdir(parents=True, exist_ok=True)
@@ -253,46 +237,11 @@ class CopymangaDLManger:
         self.is_finished = False
         return
 
-    def GetFileOrm_WithDlStatus(self, session: Session, dl_status: int) -> database.TableFiles | None:
-        Table = database.TableFiles
-        return session.scalars(
-            select(Table)
-            .where(Table.dl_status == dl_status)  #
-            .where(Table.dl_skip == False)  # noqa: E712
-            .order_by(Table.index),
-        ).first()
-
-    def GetFilesIndex_WithDlStatus(self, session: Session, dl_status: int) -> None | List[int]:
-        Table = database.TableFiles
-
-        files = session.scalars(
-            select(Table)
-            .where(Table.dl_status == dl_status)  #
-            .where(Table.dl_skip == False)  # noqa: E712
-            .order_by(Table.index),
-        ).all()
-
-        if len(files) == 0:
-            return None
-
-        return [file.index for file in files]
-
-    def GetFile_WithIndex(self, session: Session, index: int):
-        Table = database.TableFiles
-        return session.scalars(
-            select(Table).where(Table.index == index),
-        ).one()
-
     def TaskCompleted(self, task: Task):
         if not task.Save():
             self.logger.error(f"{task} 无法移动缓存")
             return False
-
-        with Session(self.sql_client.engine) as session:
-            item = self.GetFile_WithIndex(session, task.orm_bind)
-            item.dl_status = database.FileDlStatus.Completed
-            session.commit()
-
+        self.database.file.Set_DlStatus_Completed(task.orm_bind)
         return True
 
     def TaskTryfix(self, task: Task):
@@ -311,7 +260,7 @@ class CopymangaDLManger:
     def ActiveQueueZero(self):
         return len(self.active_tasks) == 0
 
-    def CreateTask(self, session: Session, file: database.TableFiles):
+    def CreateTask(self, file: database.FileORM):
         # 新建下载任务
         task = Task(
             self.aria2_client,
@@ -322,8 +271,8 @@ class CopymangaDLManger:
         status = task.LoadOrmFile(file)
         # 开始下载 标记到数据库
         if status == Task.LOAD_Succ_WaitSmbmit:
-            file.dl_status = database.FileDlStatus.Active
-            session.commit()
+            file.dl_status = database.File.DlStatus.Active
+            self.database.Commit()
             task.orm_bind = file.index
             task.Start()
             self.lock.CountAdd()
@@ -331,30 +280,24 @@ class CopymangaDLManger:
             return True
         # 非法URL 标记到数据库
         elif status == Task.LOAD_Error_InvalidUrl:
-            file.dl_status = database.FileDlStatus.InvalidUrl
+            file.dl_status = database.File.DlStatus.InvalidUrl
             file.dl_skip = True
-            session.commit()
+            self.database.Commit()
             return False
         # 路径故障 标记到数据库
         elif status == Task.LOAD_Error_PathProblem:
-            file.dl_status = database.FileDlStatus.PathProblem
-            session.commit()
+            file.dl_status = database.File.DlStatus.Error
+            self.database.Commit()
         else:
             raise ValueError(f"task: load orm return status {status}")
         self.logger.error(f"创建任务失败 {task} ")
         return False
 
-    def CreateTasks(self, session: Session, files: Sequence[database.TableFiles]):
-        for file in files:
-            self.CreateTask(session, file)
-            continue
-        return
-
-    def AddFiles(self, files_index: List[int]):
+    def AddFiles(self, files: List[database.FileORM]):
         if self.ActiveQueueFull():
             return False
 
-        if len(files_index) == 0:
+        if len(files) == 0:
             return None
 
         if not self.lock.Ready():
@@ -365,36 +308,33 @@ class CopymangaDLManger:
             return False
 
         self.is_throttled = False
-        index = files_index.pop(0)
+        file = files.pop(0)
 
-        with Session(self.sql_client.engine) as session:
-            file = self.GetFile_WithIndex(session, index)
-            status = self.CreateTask(session, file)
+        status = self.CreateTask(file)
 
         return status
 
-    def AddFile(self, dl_status: int = database.FileDlStatus.NewFile):
+    def AddFile(self, dl_status: int = database.File.DlStatus.Wait):
         if self.ActiveQueueFull():
             return False
 
-        with Session(self.sql_client.engine) as session:
-            file = self.GetFileOrm_WithDlStatus(
-                session,
-                dl_status,
-            )
-            if file is None:
-                return None
+        file = self.database.file.GetFirst(
+            database.FileOptional(dl_status=dl_status),
+        )
 
-            # 限制API请求次数
-            if not self.lock.Ready():
-                sec = self.lock.ReleaseTime()
-                if self.is_throttled is False and sec != 0:
-                    self.logger.debug(f"等待DL请求数 {self.lock.ReleaseTime()}s")
-                self.is_throttled = True
-                return False
+        if file is None:
+            return None
 
-            self.is_throttled = False
-            status = self.CreateTask(session, file)
+        # 限制API请求次数
+        if not self.lock.Ready():
+            sec = self.lock.ReleaseTime()
+            if self.is_throttled is False and sec != 0:
+                self.logger.debug(f"等待DL请求数 {self.lock.ReleaseTime()}s")
+            self.is_throttled = True
+            return False
+
+        self.is_throttled = False
+        status = self.CreateTask(file)
         return status
 
     def PrintCheckTasks(self):
@@ -408,26 +348,26 @@ class CopymangaDLManger:
             if status is None:
                 raise ValueError
 
-            # 获取完成百分比
+            # 获取百分比
             if status.totalLength == 0:
                 rate_str = f"00 "
             else:
                 rate = int((status.completedLength / status.totalLength) * 100)
                 if rate == 100:
-                    rate_str = f"++"
+                    rate_str = f"=="
                 else:
                     rate_str = f"{str(rate).zfill(2)} "
 
-            # 标记数据库 文件下载已经完成
+            # 下载完成
             if status.status == "complete" and self.TaskCompleted(task):
                 rm_tasks.append(task)
-                progress_bar += f"++ "
+                progress_bar += f"-- "
 
             # 下载出现错误 重试五次后放弃
             elif status.status == "error" and self.TaskTryfix(task):
                 progress_bar += f"ER "
 
-            # 下载完成 移动缓存
+            # 下载中
             elif status.status == "active":
                 progress_bar += rate_str
 
@@ -458,17 +398,15 @@ class CopymangaDLManger:
         return len(rm_tasks)
 
     def DownloadMulti(self, dl_status: int):
-        with Session(self.sql_client.engine) as session:
-            files = self.GetFilesIndex_WithDlStatus(session, dl_status)
+        files = self.database.file.GetAll(
+            database.FileOptional(dl_status=dl_status),
+        )
 
-        if files is None:
+        if len(files) == 0:
             self.logger.debug(f"没有可下载的文件")
             return
 
-        self.logger.info(f"下载 {files} 个文件")
-
-        if files is None:
-            return
+        self.logger.info(f"下载 {len(files)} 个文件")
 
         is_finished = False
         while True:
@@ -479,7 +417,7 @@ class CopymangaDLManger:
             if is_finished and self.ActiveQueueZero():
                 break
 
-            if (  # 未完成/队列空闲/有请求数 继续增加任务
+            if (  # 有待下载文件+队列空闲+有请求数 继续增加任务
                 not is_finished  #
                 and not self.ActiveQueueFull()
                 and not self.is_throttled
@@ -516,20 +454,20 @@ class CopymangaDLManger:
         return
 
     def Download_Unfinished(self):
-        self.logger.info(f"检查未完成的任务")
+        self.logger.info(f"检查未完成文件")
         status = self.aria2_client.GetGlobalStat()
         if status.numActive != 0:
             self.logger.error("下载服务中还有正在下载的任务 禁止检查数据库未完成文件")
             return
-        return self.DownloadMulti(database.FileDlStatus.Active)
+        return self.DownloadMulti(database.File.DlStatus.Active)
 
     def Download_NewFile(self):
-        self.logger.info(f"检查未提交的文件")
-        return self.DownloadFirst(database.FileDlStatus.NewFile)
+        self.logger.info(f"检查未新文件")
+        return self.DownloadFirst(database.File.DlStatus.Wait)
 
     def Download_PathProblemFile(self):
-        self.logger.info(f"检查路径故障的文件")
-        return self.DownloadMulti(database.FileDlStatus.PathProblem)
+        self.logger.info(f"检查一般故障文件")
+        return self.DownloadMulti(database.File.DlStatus.Error)
 
     def Run(self, auto_exit: bool = False):
         self.thread_exit = False
@@ -557,7 +495,7 @@ def module_test():
 
     manger = CopymangaDLManger(
         aria2tool.Aria2Client(server.Url(), server.Token()),
-        database.SqliteClient(DB_ROOT / Path(f"silentwitchchenmodemonvdemimi.db")),
+        database.ComicDatabase(DB_ROOT / Path(f"silentwitchchenmodemonvdemimi.db")),
         win32proxy().get_proxy(),
         DOWNLOAD_ROOT,
         TEMP_ROOT,

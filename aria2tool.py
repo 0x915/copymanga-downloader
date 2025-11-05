@@ -34,9 +34,11 @@ def CheckHostPortIdle(port: int):
 data = Path("./data")
 data.mkdir(exist_ok=True)
 
+globle_server_id: List[int] = []
+
 
 class Aria2Server:
-    def __init__(self, dl_dir: str, dl_max: int) -> None:
+    def __init__(self, dl_dir: str, dl_max: int, server_id: int = 0) -> None:
         self.logger = logger.ObjLogger(self)
         self._port: int = int(6800)
         self._token: str = str()
@@ -75,20 +77,22 @@ class Aria2Server:
             f"--rpc-secret={self._token}",
         ]
 
-        self._stdout_logfile = data / Path("aria2c-server.0.stdout.log")
-        self._stderr_logfile = data / Path("aria2c-server.0.stderr.log")
-
-        count = 0
-        while self._stdout_logfile.exists() or self._stderr_logfile.exists():
-            count += 1
-            self._stdout_logfile = data / Path(f"aria2c-server.{count}.stdout.log")
-            self._stderr_logfile = data / Path(f"aria2c-server.{count}.stderr.log")
+        while True:
+            if server_id in globle_server_id:
+                server_id += 1
+                continue
+            globle_server_id.append(server_id)
+            break
+        
+        self.server_id = server_id
+        self._stdout_logfile = data / Path(f"aria2c-server.{self.server_id}.stdout.log")
+        self._stderr_logfile = data / Path(f"aria2c-server.{self.server_id}.stderr.log")
 
         self._stdout_bufw: Optional[BufferedWriter] = None
         self._stderr_bufw: Optional[BufferedWriter] = None
         self._process: Optional[subprocess.Popen] = None
 
-        self.logger.info(f"初始化下载服务 {self.Port()} {self.Token()}")
+        self.logger.debug(f"Aria2 RPC Port={self.Port()} Token={self.Token()}")
         self.logger.debug(f"stdout -> {self._stdout_logfile.as_posix()}")
         self.logger.debug(f"stderr -> {self._stderr_logfile.as_posix()}")
 
@@ -122,7 +126,7 @@ class Aria2Server:
         if self._stderr_bufw is not None:
             self._stderr_bufw.close()
             self._stderr_bufw = None
-        self.logger.debug(f"下载服务已停止")
+        self.logger.debug(f"aria2c -> stop")
         return
 
     def Restart(self):
@@ -138,7 +142,7 @@ class Aria2Server:
             stdout=self._stdout_bufw,
             stderr=self._stderr_bufw,
         )
-        self.logger.debug(f"启动下载服务进程 PID{self._process.pid} {self._process}")
+        self.logger.debug(f"aria2c -> pid={self._process.pid}")
         return
 
     def isRuning(self) -> bool:

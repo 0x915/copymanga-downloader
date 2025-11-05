@@ -1,6 +1,7 @@
 import os
 import time
 import winreg
+import traceback
 
 from pathlib import Path
 from typing import List, Tuple
@@ -8,16 +9,22 @@ from typing import List, Tuple
 import database
 import aria2tool
 import dlmanager
+import packer
 from copymanga import CopymangaObject
 
 
 DB_ROOT = Path("db.nosync")
 DOWNLOAD_ROOT = Path("dl.nosync")
+CBZ_ROOT = Path("cbz.nosync")
 TEMP_ROOT = Path("temp.nosync")
 
 DB_ROOT.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+CBZ_ROOT.mkdir(parents=True, exist_ok=True)
+
+FILE_PREFIX = "*."
+FILE_SUFFIX = "-*.*"
 
 
 class win32proxy:
@@ -95,16 +102,19 @@ class Console:
             "help": Command(True, self.Cmd_Help, [], "显示命令列表"),
             "update": Command(True, self.Cmd_Update, ["index"], "更新数据库"),
             "download": Command(True, self.Cmd_Download, ["index"], "下载文件"),
-            "detect": Command(True, self.Cmd_Detect, ["index"], "下载文件"),
+            "scan": Command(True, self.Cmd_Detect, ["index"], "标记存在的文件到已下载"),
             "check": Command(True, self.Cmd_Check, ["index"], "检查本地文件"),
+            "pack-info": Command(True, self.Cmd_PackComicInfo, ["index"], "显示漫画打包信息"),
+            "pack-update": Command(True, self.Cmd_PackComicUpdate, ["num", "start", "index"], "更新漫画打包信息 num=打包分割章节号 start=起始章节号"),
+            "pack-run": Command(True, self.Cmd_PackComicRun, ["index"], "打包漫画"),
             "show": Command(False, self.Cmd_Show, ["index"], "显示详细信息"),
             "mark": Command(False, self.Cmd_Mark, ["index"], "标记已下载但不存在的文件"),
             "delete": Command(False, self.Cmd_DeleteDatabase, ["index"], "删除数据库"),
             "search": Command(False, self.Cmd_Search, ["keyword"], "使用关键词搜索并创建数据库"),
             "init": Command(False, self.Cmd_Init, ["pathword"], "使用路径词创建数据库"),
-            "list": Command(False, self.ShowComics, [], "显示漫画列表"),
-            "clear": Command(False, self.Cmd_Clear, [], "清除控制台内容"),
-            "exit": Command(False, self.Cmd_Exit, [], "退出"),
+            "list": Command(False, self.ShowComic, [], "显示漫画列表"),
+            "clear": Command(False, self.Cmd_Clear, [], "清除控制台历史输出"),
+            "exit": Command(False, self.Cmd_Exit, [], "退出 或 双击Ctrl+C"),
         }
 
         self.FormatCommands()
@@ -132,7 +142,7 @@ class Console:
 
         self.commands_str: str = ""
         for arg, desc in zip(arg_list, desc_list):
-            self.commands_str += f"{arg:{arg_length}s}    {desc}\n"
+            self.commands_str += f"┃ {arg:{arg_length}s}    {desc}\n"
 
         return
 
@@ -142,30 +152,28 @@ class Console:
         for db_file in self.database_root.glob(f"*.db"):
             pathword = "UnknownPathword"
             name = "UnknownDisplay"
-
+            print(f"加载数据库 {db_file.as_posix()}")
             try:
-                db = database.SqliteClient(db_file)
-                check_name = CopymangaObject.GetMetadata(db, "__name__")
-                if check_name is not None:
-                    name = check_name[0][1]
-                check_pathword = CopymangaObject.GetMetadata(db, "__pathword__")
-                if pathword is not None:
-                    pathword = check_pathword[0][1]
-            except Exception:
+                db = database.ComicDatabase(db_file)
+                name = db.attribute.GetName()
+                pathword = db.attribute.GetPathword()
+            except Exception as e:
+                print(f"错误 {e}")
                 print(f"无法读取数据库 {db_file.resolve().as_posix()}")
                 continue
 
             local_storage = Path(f"{self.download_root}/{name}")
-            
+
             if local_storage.exists():
-                print(SizeDir(local_storage))
-                size = f"{SizeDir(local_storage)/1000000:.1f} MiB"
+                size = ""
+                # size = f"{SizeDir(local_storage) / 1000000:.1f} MiB"
             else:
                 size = "无本地文件"
 
             self.comics.append((pathword, f"{name} | {size}"))
             continue
-
+        
+        print()
         return
 
     def ConvertIndex(self, cmd: str, num: str):
@@ -233,7 +241,7 @@ class Console:
             server.Restart()
             manger = dlmanager.CopymangaDLManger(
                 aria2tool.Aria2Client(server.Url(), server.Token()),
-                database.SqliteClient(self.database_root / Path(f"{pathword}.db")),
+                database.ComicDatabase(self.database_root / Path(f"{pathword}.db")),
                 self.proxy,
                 self.download_root,
                 self.temp_root,
@@ -266,6 +274,49 @@ class Console:
 
         return self.Cmd_All(argv, Check)
 
+    def Cmd_PackComicInfo(self, argv: List[str]):
+        def Show(pathword: str):
+            packer.FilePacker(
+                CBZ_ROOT,
+                DOWNLOAD_ROOT,
+                DB_ROOT,
+                pathword,
+            ).ShowCbzSection()
+            return
+
+        return self.Cmd_All(argv, Show)
+
+    def Cmd_PackComicUpdate(self, argv: List[str]):
+        split_num = int(argv[1])
+        split_start = int(argv[2])
+
+        def Update(pathword: str):
+            packer.FilePacker(
+                CBZ_ROOT,
+                DOWNLOAD_ROOT,
+                DB_ROOT,
+                pathword,
+            ).UpdateCbzInfo_SplitNumber(
+                split_num,
+                split_start,
+            )
+            return
+
+        pathword = argv[3]
+        return self.Cmd_All(["pack-update", pathword], Update)
+
+    def Cmd_PackComicRun(self, argv: List[str]):
+        def Output(pathword: str):
+            packer.FilePacker(
+                CBZ_ROOT,
+                DOWNLOAD_ROOT,
+                DB_ROOT,
+                pathword,
+            ).OutputAllPackage()
+            return
+
+        return self.Cmd_All(argv, Output)
+
     def Cmd_Mark(self, argv: List[str]):
         num = self.ConvertIndex(argv[0], argv[1])
         if num is None:
@@ -291,7 +342,7 @@ class Console:
         comic = self._CopymangaIndex(num)
         check_delete = input(f"删除 {comic.database} 数据库文件 输入[Yes]确认操作(区分大小写)=")
         if check_delete == "Yes":
-            db = comic.database.GetFilePath()
+            db = comic.database.GetDatabaseFilePath()
             print(f'保留本地目录 "{(self.download_root / Path(comic.comic.name)).as_posix()}"')
             del comic
             db.unlink()
@@ -306,7 +357,7 @@ class Console:
             print(f" {cmd} keyword为空 未输入任何关键词.")
             return
         comic = self._CopymangaKeyword(keyword)
-        print(f"初始化数据库 {comic.comic.name} / {comic.comic.path_word} ")
+        print(f"增加 {comic.comic.name} / {comic.comic.path_word}")
         return
 
     def Cmd_Init(self, argv: List[str]):
@@ -315,8 +366,9 @@ class Console:
         if len(pathword) == 0:
             print(f" {cmd} pathword为空 未输入任何关键词.")
             return
+
         comic = self._CopymangaPathword(pathword)
-        print(f"初始化数据库 {comic.comic.name} / {comic.comic.path_word} ")
+        print(f"增加 {comic.comic.name} / {comic.comic.path_word}")
         return
 
     def Cmd_Clear(self, argv: List[str]):
@@ -327,26 +379,28 @@ class Console:
 
     def ShowCommand(self, argv: List[str] | None = None):
         print()
-        print(self.commands_str)
+        print("┏━━━━━━ 所有命令")
+        print(self.commands_str, end="")
+        print("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    def ShowComics(self, argv: List[str] | None = None):
+    def ShowComic(self, argv: List[str] | None = None):
         print()
         self.ScanComics()
 
         if len(self.comics) == 0:
             print("[ 无漫画 ]")
             return
-
+        print("┏━━━━━━ 漫画列表")
         for i, data in enumerate(self.comics):
             path_word = data[0]
             manga_name = data[1]
-            print(f"{str(i).zfill(2)}. [ {manga_name} | {path_word} ] ")
-
-        print()
+            print(f"┃ {str(i).zfill(2)}. [ {manga_name} | {path_word} ] ")
+        print("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return
 
     def Run(self):
-        self.ShowComics()
+        
+        self.ShowComic()
         self.ShowCommand()
         self.exit_status = False
 
@@ -375,6 +429,7 @@ class Console:
                 time.sleep(1)
                 continue
             except Exception as e:
+                traceback.print_exc()
                 print(f"错误：{e}")
 
 
@@ -391,5 +446,5 @@ if __name__ == "__main__":
         ).Run()
     except KeyboardInterrupt:
         exit()
-    except Exception:
-        raise Exception
+    except Exception as e:
+        raise e
