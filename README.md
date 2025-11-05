@@ -3,39 +3,48 @@
 ```
 Active code page: 65001
 
-00. [ A | 无本地文件 | a_path_word ] 
-01. [ B | 543.5 MiB | b_path_word ] 
-02. [ C | 无本地文件 | c_path_word ] 
-03. [ D | 无本地文件 | d_path_word ] 
-04. [ E | 无本地文件 | e_path_word ] 
-05. [ F | 无本地文件 | f_path_word ] 
+┏━━━━━━ 漫画列表
+┃ 00. [ 1 |  | 1 ] 
+┃ 01. [ 2 |  | 2 ] 
+┃ 02. [ 3 |  | 3 ] 
+┃ 03. [ 4 |  | 4 ] 
+┃ 04. [ 5 |  | 5 ] 
+┃ 05. [ 6 |  | 6 ] 
+┃ 06. [ 7 |  | 7 ] 
+┃ 07. [ 8 |  | 8 ] 
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-
-help                     显示命令列表
-update [index/all]       更新数据库
-download [index/all]     下载文件
-detect [index/all]       下载文件
-check [index/all]        检查本地文件
-show [index]             显示详细信息
-mark [index]             标记已下载但不存在的文件
-delete [index]           删除数据库
-search [keyword]         使用关键词搜索并创建数据库
-init [pathword]          使用路径词创建数据库
-list                     显示漫画列表
-clear                    清除控制台内容
-exit                     退出
+┏━━━━━━ 所有命令
+┃ help                                      显示命令列表
+┃ update [index/all]                        更新数据库
+┃ download [index/all]                      下载文件
+┃ scan [index/all]                          标记存在的文件到已下载
+┃ check [index/all]                         检查本地文件
+┃ pack-info [index/all]                     显示漫画打包信息
+┃ pack-update [num] [start] [index/all]     更新漫画打包信息 num=打包分割章节号 start=起始章节号
+┃ pack-run [index/all]                      打包漫画
+┃ show [index]                              显示详细信息
+┃ mark [index]                              标记已下载但不存在的文件
+┃ delete [index]                            删除数据库
+┃ search [keyword]                          使用关键词搜索并创建数据库
+┃ init [pathword]                           使用路径词创建数据库
+┃ list                                      显示漫画列表
+┃ clear                                     清除控制台历史输出
+┃ exit                                      退出 或 双击Ctrl+C
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 > 
 ```
 
-## 尚未完成
-如需试用 aria2c 需要在环境变量内可用
+## 使用说明
+下载实现依赖 aria2c 需要在环境变量内可用
 
 脚本工作后会生成数据目录  
  - db.nosync 漫画元数据与文件数据库
  - dl.nosync 漫画本地文件下载根目录
- - 例 db.nosync\漫画路径词.db
- - 例 dl.nosync\漫画名称\分组名称\*.webp
+ - 例 db.nosync\漫画路径词.db 本地数据库/切勿修改
+ - 例 db.nosync\漫画路径词.ini 打包CBZ配置/如需自定义打包章节需要手动编辑
+ - 例 dl.nosync\漫画名称\分组名称\排序索引.章节名-页号.webp
 
 ## 脚本依赖
  - python -m pip install sqlalchemy spdlog requests  
@@ -47,6 +56,5 @@ exit                     退出
  - 自动使用系统网络代理
 
 ## 设计中功能
- - 自动CBZ打包(单行本/章节数分割/文件数分割)
  - 更新章节同时下载的多线程模式
  - 额外的图形界面
